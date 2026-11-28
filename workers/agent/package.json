@@ -1,0 +1,15 @@
+{
+  "name": "thehumanbox-agent",
+  "private": true,
+  "description": "TheHumanBox super developer agent — Cloudflare Agents SDK (Durable Objects) + Workers AI / any custom OpenAI-compatible model. Drives the live game through a page-side bridge.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "agents": "0.34.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

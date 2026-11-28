@@ -1,0 +1,10 @@
+{
+  "name": "thehumanbox-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TheHumanBox super backend: Cloudflare Worker + KV + D1 + Workers AI + Cron",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  }
+}

@@ -1,0 +1,45 @@
+# TheHumanBox super developer agent — Cloudflare Agents SDK.
+#
+#   * A Durable Object (agents SDK `Agent` subclass) that holds a WebSocket
+#     conversation with the game page's bridge (apps/web/public/cloud-sync.js).
+#   * Model routing: any Workers AI text model via the AI binding, OR any
+#     custom OpenAI-compatible endpoint (OpenAI / DeepSeek / OpenRouter /
+#     Ollama / vLLM ...) whose base URL + key + model the browser sends
+#     per-request — keys never touch storage.
+#   * An agentic tool loop: the model answers in plain text or with a
+#     `TOOL:` JSON action; page tools (game control, world commands) are
+#     executed by the connected browser, server tools (backend stats,
+#     chronicle) run here. Works with every model, with or without native
+#     tool-calling support.
+#
+# Deployed by .github/workflows/deploy-site.yml (deploy-agent job) with
+# `npm install && npx wrangler@4 deploy`.
+name = "thehumanbox-agent"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+# The agents SDK imports Node built-ins (path, etc.) — nodejs_compat resolves
+# them inside the Workers runtime.
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+account_id = "caa845f848f2c4f9bdd61956e9254b4a"
+
+# The super backend worker's origin — server-side tools fetch it directly.
+[vars]
+API_ORIGIN = "https://thehumanbox-api.yeyilin2010.workers.dev"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "DevAgent"
+class_name = "DevAgent"
+# The DevAgent class was already created on this account (namespace
+# eeafe7a4c6b9490eb06cb66b1d5a4569, SQLite-backed) with the very first
+# deploy; migrations are only needed when a class is first introduced, so
+# none are listed here. A fresh deployment on a NEW account would need:
+#   [migrations]
+#   tag = "v1"
+#   new_sqlite_classes = ["DevAgent"]
+
+[observability]
+enabled = true

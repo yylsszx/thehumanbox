@@ -1,0 +1,325 @@
+# Deploys the upstream mirror of TheHumanBox to Cloudflare Pages, plus the
+# super backend Worker and the DevAgent, straight from main.
+#
+#   * https://thehumanbox-upstream.pages.dev — the game
+#     (root base; apps/web/public/_headers adds the cross-origin isolation
+#     headers, so the threaded wasm engine is used where the browser allows;
+#     apps/web/functions is picked up by wrangler for the /ingest proxy PLUS
+#     the /api and /agent same-origin proxies — mainland networks cannot
+#     resolve *.workers.dev, so the panel talks to the pages.dev host;
+#     apps/web/public/cloud-sync.js is copied to dist/ by vite and injected
+#     into dist/index.html below — the ⚡ SUPER panel + the DevAgent bridge)
+#   * https://thehumanbox-api.yeyilin2010.workers.dev — the API
+#     (see workers/api and docs/SUPER_BACKEND.md)
+#   * https://thehumanbox-agent.yeyilin2010.workers.dev — the DevAgent
+#     (see workers/agent: Agents SDK Durable Object + model routing)
+#
+# The last job (verify-same-origin) re-tests everything through the
+# pages.dev origin — the path real players use.
+#
+# The wasm recipe is the one the upstream pipeline proves green
+# (scripts/build-wasm.sh + scripts/build-wasm-threads.sh). Public-repo CI
+# minutes are free, so every code push to main redeploys; Swatinem's target
+# cache keeps rebuilds quick. The paths filter keeps the daily sync
+# heartbeat from rebuilding the whole site when nothing changed.
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "workers/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".node-version"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: true
+
+jobs:
+  build-wasm:
+    name: Build wasm sim-core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # The threaded build rebuilds std with atomics, so it needs this
+      # nightly (same pin as the upstream pipeline).
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: nightly-2025-11-15
+          targets: wasm32-unknown-unknown
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: site
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: Build wasm sim-core (single)
+        run: scripts/build-wasm.sh
+      - name: Build wasm sim-core (threads)
+        run: scripts/build-wasm-threads.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: site-wasm
+          path: apps/web/src/wasm
+          retention-days: 1
+
+  cloudflare-pages:
+    name: Deploy to Cloudflare Pages
+    needs: build-wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Stamp this build
+        id: stamp
+        run: echo "ts=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+      - name: Download wasm sim-core
+        uses: actions/download-artifact@v8
+        with:
+          name: site-wasm
+          path: apps/web/src/wasm
+      # Root base (the pages.dev host serves at /), so no VITE_BASE here.
+      - name: pnpm run build
+        working-directory: apps/web
+        env:
+          VITE_GIT_SHA: ${{ github.sha }}
+          VITE_BUILD_TS: ${{ steps.stamp.outputs.ts }}
+        run: pnpm run build
+      # vite copies public/ into dist/, so cloud-sync.js is already there.
+      # Inject its tag BEFORE the first script tag (the app's splash script)
+      # so it can patch window.Worker before the sim worker is created.
+      - name: Inject the SUPER panel script tag
+        working-directory: apps/web
+        run: |
+          set -euo pipefail
+          test -f dist/cloud-sync.js
+          python3 - <<'PY'
+          path = "dist/index.html"
+          html = open(path, encoding="utf-8").read()
+          tag = '<script src="/cloud-sync.js"></script>'
+          assert "/cloud-sync.js" not in html, "already injected"
+          assert "<script" in html, "no script tag found"
+          html = html.replace("<script", tag + "\n  <script", 1)
+          open(path, "w", encoding="utf-8").write(html)
+          print("injected /cloud-sync.js before the first script tag")
+          PY
+          grep -c "cloud-sync.js" dist/index.html
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/web
+          # apps/web/functions (the /ingest proxy) sits next to dist, so
+          # wrangler uploads it with the bundle.
+          command: pages deploy dist --project-name=thehumanbox-upstream --branch=main
+
+  cloudflare-api:
+    name: Deploy the super backend worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: wrangler deploy
+        working-directory: workers/api
+        run: npx --yes wrangler@4 deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Smoke-test the API
+        working-directory: workers/api
+        run: |
+          set -euo pipefail
+          U=https://thehumanbox-api.yeyilin2010.workers.dev
+          check() { # method url expected-status [body]
+            local method=$1 url=$2 expect=$3 body=${4:-}
+            local args=(-s -o /tmp/smoke.json -w '%{http_code}' -X "$method" "$url")
+            if [ -n "$body" ]; then args+=(-H 'Content-Type: application/json' -d "$body"); fi
+            local code; code=$(curl --max-time 30 "${args[@]}")
+            echo "$method $url -> $code (want $expect)"
+            head -c 600 /tmp/smoke.json; echo; echo
+            [ "$code" = "$expect" ]
+          }
+          check GET  "$U/health" 200
+          check GET  "$U/v1/scores?limit=5" 200
+          check GET  "$U/v1/stats" 200
+          CODE="smoke-$(openssl rand -hex 12)"
+          check POST "$U/v1/saves" 200 "{\"code\":\"$CODE\",\"data\":{\"smoke\":true,\"at\":\"$(date -u +%FT%TZ)\"}}"
+          check GET  "$U/v1/saves/$CODE" 200
+          check POST "$U/v1/scores" 201 "{\"name\":\"ci-smoke\",\"score\":1,\"tick\":1,\"epoch\":1}"
+          check POST "$U/v1/events" 202 "{\"kind\":\"smoke\",\"payload\":{\"from\":\"github-actions\"}}"
+          # chronicle v2: living civilization + rich live-world data
+          check POST "$U/v1/chronicle" 200 '{"name":"Smoke Test","score":7,"epoch":1,"status":"living","world":{"population":42,"era":"iron","tribes":[{"name":"T1","count":42}],"events":["T1 建立了聚落"]}}'
+          # error paths
+          check GET  "$U/v1/saves/does-not-exist-12345" 404
+          check POST "$U/v1/scores" 400 '{"name":""}'
+
+  deploy-agent:
+    name: Deploy the DevAgent (Agents SDK)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: npm install
+        working-directory: workers/agent
+        run: npm install --no-audit --no-fund
+      - name: wrangler deploy
+        working-directory: workers/agent
+        run: npx --yes wrangler@4 deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Smoke-test the DevAgent
+        working-directory: workers/agent
+        run: |
+          set -euo pipefail
+          A=https://thehumanbox-agent.yeyilin2010.workers.dev
+          # The workers.dev route takes a moment to propagate after deploy.
+          code=000
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 10
+            code=$(curl -s -o /tmp/agent-health.json -w '%{http_code}' --max-time 30 "$A/health" || echo 000)
+            echo "GET /health (try $i) -> $code"
+            [ "$code" = "200" ] && break
+          done
+          cat /tmp/agent-health.json; echo
+          [ "$code" = "200" ]
+          code=$(curl -s -o /tmp/agent-chat.json -w '%{http_code}' --max-time 100 \
+            -X POST "$A/chat" -H 'Content-Type: application/json' \
+            -d '{"text":"Reply with exactly: OK. Do not call any tool.","model":"@cf/meta/llama-3.3-70b-instruct-fp8-fast"}')
+          echo "POST /chat -> $code"; cat /tmp/agent-chat.json; echo
+          [ "$code" = "200" ]
+          # BYOK provider routing: no key → friendly error (proves the route
+          # is wired without needing a real key)
+          code=$(curl -s -o /tmp/agent-prov.json -w '%{http_code}' --max-time 30 \
+            -X POST "$A/chat" -H 'Content-Type: application/json' \
+            -d '{"text":"ok","model":"provider:zhipu:glm-5.3-flash","providerKey":""}')
+          echo "POST /chat (provider, no key) -> $code"; cat /tmp/agent-prov.json; echo
+          [ "$code" = "502" ]
+          grep -q "API Key" /tmp/agent-prov.json
+          node -e '
+          const ws = new WebSocket("'"$A"'/agents/dev-agent/ci-" + Math.random().toString(36).slice(2));
+          const done = (ok, why) => { console.log((ok ? "PASS" : "FAIL") + " " + why); try { ws.close(); } catch {} process.exit(ok ? 0 : 1); };
+          const timer = setTimeout(() => done(false, "agent ws timeout"), 150000);
+          ws.onopen = () => ws.send(JSON.stringify({ type: "chat", text: "Say OK. Do not call any tool.", model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" }));
+          ws.onmessage = (ev) => {
+            const m = JSON.parse(ev.data);
+            if (m.type === "error") { clearTimeout(timer); done(false, "agent error: " + String(m.error).slice(0, 160)); }
+            if (m.type === "assistant") { clearTimeout(timer); done(true, "agent ws chat round-trip: " + m.text.slice(0, 80)); }
+          };
+          ws.onerror = () => { clearTimeout(timer); done(false, "agent ws error"); };
+          '
+
+  verify-same-origin:
+    name: Verify the same-origin proxies (player path)
+    needs: [cloudflare-pages, deploy-agent, cloudflare-api]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Smoke-test /api, /agent and the WS splice on pages.dev
+        run: |
+          set -euo pipefail
+          S=https://thehumanbox-upstream.pages.dev
+
+          # Pages deployments propagate fast, but still retry a little.
+          code=000
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            code=$(curl -s -o /tmp/p-health.json -w '%{http_code}' --max-time 30 "$S/agent/health" || echo 000)
+            echo "GET /agent/health (try $i) -> $code"
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+          cat /tmp/p-health.json; echo
+          [ "$code" = "200" ]
+
+          # the API proxy
+          code=$(curl -s -o /tmp/p-stats.json -w '%{http_code}' --max-time 30 "$S/api/v1/stats")
+          echo "GET /api/v1/stats -> $code"; head -c 300 /tmp/p-stats.json; echo
+          [ "$code" = "200" ]
+
+          # the model catalog
+          code=$(curl -s -o /tmp/p-models.json -w '%{http_code}' --max-time 30 "$S/agent/models")
+          echo "GET /agent/models -> $code"
+          [ "$code" = "200" ]
+          node -e 'const d=require("/tmp/p-models.json"); if(!d.ok||!Array.isArray(d.models)||d.models.length<10)process.exit(1); console.log("catalog:", d.models.length, "models, default", d.default_model);'
+
+          # static site still cross-origin isolated (functions must not break _headers)
+          curl -sI --max-time 30 "$S/" | tee /tmp/p-head.txt
+          grep -qi '^cross-origin-embedder-policy: require-corp' /tmp/p-head.txt
+          grep -qi '^cross-origin-opener-policy: same-origin' /tmp/p-head.txt
+
+          # THE critical test: a full chat round-trip over the proxied
+          # WebSocket (Pages Function → fetch Upgrade → DO splice). Deltas
+          # arrive batched (~1 frame per 120ms); anything that is not a
+          # delta gets logged so a failure says WHY, not just "timeout".
+          node -e '
+          const ws = new WebSocket("wss://thehumanbox-upstream.pages.dev/agent/ws");
+          const done = (ok, why) => { console.log((ok ? "PASS" : "FAIL") + " " + why); try { ws.close(); } catch {} process.exit(ok ? 0 : 1); };
+          const timer = setTimeout(() => done(false, "proxied ws timeout"), 150000);
+          ws.onopen = () => ws.send(JSON.stringify({ type: "chat", text: "Say OK. Do not call any tool.", model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" }));
+          let frames = 0;
+          ws.onmessage = (ev) => {
+            const m = JSON.parse(ev.data);
+            frames += 1;
+            if (m.type === "delta") return;
+            console.log("ws event:", m.type, String(m.text ?? m.error ?? m.summary ?? "").slice(0, 90));
+            if (m.type === "assistant") { clearTimeout(timer); done(true, "proxied ws chat round-trip: " + m.text.slice(0, 80) + " (" + frames + " frames)"); }
+            if (m.type === "error") { clearTimeout(timer); done(false, "agent error: " + String(m.error).slice(0, 200)); }
+          };
+          ws.onclose = () => { if (frames > 0) { clearTimeout(timer); done(false, "proxied ws closed after " + frames + " frames (no assistant)"); } };
+          ws.onerror = () => { clearTimeout(timer); done(false, "proxied ws error"); };
+          '

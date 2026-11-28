@@ -1,0 +1,78 @@
+# Keeps this mirror in step with upstream 1homsi/thehumanbox, every day.
+#
+#   branch `main`     = upstream/main tip + our additions overlay
+#                       (workers/api, scripts/sync_upstream.py,
+#                        docs/SUPER_BACKEND.md, the two deploy/sync workflows)
+#   branch `upstream` = a pure mirror ref at upstream/main's tip
+#
+# Runs daily at 01:00 UTC = 09:00 Asia/Shanghai (GitHub may delay scheduled
+# runs by a few minutes) and on demand via workflow_dispatch.
+#
+# The sync itself is scripts/sync_upstream.py — a pure Git Data API rebase:
+# upstream rewrites history (release automation), so merging would conflict;
+# replaying our addition set onto their tip never does. And because the PAT
+# backing GH_PAT has no `workflows` permission, any git push that carries
+# .github/workflows changes gets rejected — the API path has no such
+# rejection, and ref updates through it still fire push events, which
+# trigger deploy-site.yml when deploy-relevant files changed. Without
+# GH_PAT (or once it expires) the same script runs on the built-in
+# GITHUB_TOKEN and the workflow kicks the deploy itself.
+#
+# The daily .last-sync heartbeat keeps the repository active so GitHub does
+# not auto-disable the schedule after 60 idle days.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Rebase the mirror onto upstream/main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PUSH_MODE: ${{ secrets.GH_PAT != '' && 'pat' || 'token' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts/sync_upstream.py
+
+      - name: Run the rebase-sync (Git Data API)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/sync_upstream.py | tee /tmp/sync.log
+
+      - name: Kick a deploy when upstream moved (token-push mode only)
+        if: env.PUSH_MODE != 'pat'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if tail -1 /tmp/sync.log | grep -q 'upstream-moved: yes'; then
+            echo "upstream moved — dispatching deploy-site"
+            gh workflow run deploy-site.yml --ref main
+          else
+            echo "upstream unchanged; no deploy needed"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Upstream sync"
+            echo '```'
+            cat /tmp/sync.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

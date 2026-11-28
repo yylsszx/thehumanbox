@@ -1,0 +1,31 @@
+# TheHumanBox super backend — deployed by .github/workflows/deploy-site.yml
+# (cloudflare-api job) with `npx wrangler deploy` and by scripts/deploy-api.sh.
+#
+# Free-tier stack:
+#   Workers (this script) + KV (stats snapshots) + D1 (saves/scores/events)
+#   + Workers AI (chronicles) + a daily Cron Trigger (rollup + prune).
+name = "thehumanbox-api"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+workers_dev = true
+account_id = "caa845f848f2c4f9bdd61956e9254b4a"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "8b58656e233947f19bcf3dc564f302fb"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "thehumanbox_db"
+database_id = "0367064a-970b-47f0-aca0-0b7553424f50"
+
+[ai]
+binding = "AI"
+
+[triggers]
+# Daily 02:30 UTC (10:30 Beijing) — after the 09:00 Beijing upstream sync,
+# so the rollup sees the freshest deployment's data.
+crons = ["30 2 * * *"]
+
+[observability]
+enabled = true
